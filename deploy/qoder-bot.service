@@ -1,0 +1,20 @@
+[Unit]
+Description=Qoder Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qoderbot
+Group=qoderbot
+WorkingDirectory=/opt/qoder-telegram-bot
+EnvironmentFile=-/opt/qoder-telegram-bot/.env
+ExecStart=/opt/qoder-telegram-bot/.venv/bin/python /opt/qoder-telegram-bot/bot.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Qoder Telegram bot (user service)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/qoder-telegram-bot
+EnvironmentFile=-%h/qoder-telegram-bot/.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/qoder-telegram-bot/.venv/bin/python %h/qoder-telegram-bot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
