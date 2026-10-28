@@ -22,9 +22,12 @@ from qoder_agent_sdk import (
 
 from approvals import Decision
 from config import Config
-from safe_commands import is_safe_command
 
 log = logging.getLogger("qoder-bot")
+
+# SDK по умолчанию читает не больше 1 МиБ на сообщение: один Read большого файла
+# или изображения обрывает задачу с "maximum buffer size".
+MAX_BUFFER_SIZE = 32 * 1024 * 1024
 
 Approver = Callable[[str, dict[str, Any], Any], Awaitable[Decision]]
 ToolObserver = Callable[[str], Awaitable[None]]
@@ -80,6 +83,12 @@ class QoderTask:
             "allowed_tools": list(self._config.allowed_tools),
             "can_use_tool": self._can_use_tool,
         }
+        if "max_buffer_size" in getattr(QoderAgentOptions, "__dataclass_fields__", {}):
+            options_kwargs["max_buffer_size"] = MAX_BUFFER_SIZE
+        else:
+            log.warning(
+                "qoder-agent-sdk без max_buffer_size: крупные сообщения могут обрывать задачу"
+            )
         if self.session_id:
             options_kwargs["resume"] = self.session_id
         if self._config.permission_mode in {"bypassPermissions", "yolo"}:
@@ -167,10 +176,6 @@ class QoderTask:
         input_data: dict[str, Any],
         context: Any,
     ) -> Any:
-        signal = getattr(context, "signal", None)
-        if signal is not None and getattr(signal, "is_set", lambda: False)():
-            return PermissionResultDeny(message="Задача остановлена.")
-
         if tool_name == "AskUserQuestion":
             questions = list(input_data.get("questions") or [])
             try:
@@ -182,20 +187,6 @@ class QoderTask:
             return PermissionResultAllow(
                 updated_input={"questions": questions, "answers": answers}
             )
-
-        if (
-            tool_name == "Bash"
-            and self._config.safe_bash_mode != "off"
-            and not input_data.get("dangerouslyDisableSandbox")
-        ):
-            command = input_data.get("command")
-            if isinstance(command, str) and is_safe_command(
-                command,
-                self._cwd,
-                allow_dev=self._config.safe_bash_mode == "dev",
-            ):
-                log.info("auto-approved Bash: %s", command[:300])
-                return PermissionResultAllow(updated_input=input_data)
 
         try:
             decision = await self._approve(tool_name, input_data, context)
