@@ -91,9 +91,9 @@ def recent_files(
     max_scan: int = 5000,
     skip_top: tuple[str, ...] = ("uploads",),
 ) -> list[tuple[str, int]]:
-    found: list[tuple[str, int]] = []
+    found: list[tuple[float, str, int]] = []
     if not base.is_dir():
-        return found
+        return []
     scanned = 0
     for path in base.rglob("*"):
         scanned += 1
@@ -109,9 +109,9 @@ def recent_files(
         except OSError:
             continue
         if stat.st_mtime >= since:
-            found.append((relative.as_posix(), stat.st_size))
-    found.sort()
-    return found[:limit]
+            found.append((stat.st_mtime, relative.as_posix(), stat.st_size))
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [(relative, size) for _, relative, size in found[:limit]]
 
 
 def human_size(size: int) -> str:

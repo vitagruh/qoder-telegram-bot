@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,9 @@ from qoder_agent_sdk import (
 
 from approvals import Decision
 from config import Config
+from safe_commands import is_safe_command
+
+log = logging.getLogger("qoder-bot")
 
 Approver = Callable[[str, dict[str, Any], Any], Awaitable[Decision]]
 ToolObserver = Callable[[str], Awaitable[None]]
@@ -163,6 +167,10 @@ class QoderTask:
         input_data: dict[str, Any],
         context: Any,
     ) -> Any:
+        signal = getattr(context, "signal", None)
+        if signal is not None and getattr(signal, "is_set", lambda: False)():
+            return PermissionResultDeny(message="Задача остановлена.")
+
         if tool_name == "AskUserQuestion":
             questions = list(input_data.get("questions") or [])
             try:
@@ -174,6 +182,20 @@ class QoderTask:
             return PermissionResultAllow(
                 updated_input={"questions": questions, "answers": answers}
             )
+
+        if (
+            tool_name == "Bash"
+            and self._config.safe_bash_mode != "off"
+            and not input_data.get("dangerouslyDisableSandbox")
+        ):
+            command = input_data.get("command")
+            if isinstance(command, str) and is_safe_command(
+                command,
+                self._cwd,
+                allow_dev=self._config.safe_bash_mode == "dev",
+            ):
+                log.info("auto-approved Bash: %s", command[:300])
+                return PermissionResultAllow(updated_input=input_data)
 
         try:
             decision = await self._approve(tool_name, input_data, context)

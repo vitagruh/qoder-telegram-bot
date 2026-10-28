@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from safe_commands import SAFE_BASH_MODES
+
 PERMISSION_MODES = {
     "default",
     "acceptEdits",
@@ -63,6 +65,7 @@ class Config:
     workspace_root: Path
     permission_mode: str
     allowed_tools: tuple[str, ...]
+    safe_bash_mode: str
     max_upload_mb: int
     task_timeout_sec: int
     approval_timeout_sec: int
@@ -96,6 +99,13 @@ def load_config() -> Config:
         if item.strip()
     )
 
+    safe_bash_mode = os.getenv("SAFE_BASH_MODE", "off").strip().lower() or "off"
+    if safe_bash_mode not in SAFE_BASH_MODES:
+        raise SystemExit(
+            f"SAFE_BASH_MODE: неизвестный режим '{safe_bash_mode}'. "
+            f"Допустимо: {', '.join(sorted(SAFE_BASH_MODES))}"
+        )
+
     root = Path(os.getenv("WORKSPACE_ROOT", "~/qoder-bot/workspace")).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +115,7 @@ def load_config() -> Config:
         workspace_root=root,
         permission_mode=mode,
         allowed_tools=tools,
+        safe_bash_mode=safe_bash_mode,
         max_upload_mb=_int("MAX_UPLOAD_MB", 20),
         task_timeout_sec=_int("TASK_TIMEOUT_SEC", 1200),
         approval_timeout_sec=_int("APPROVAL_TIMEOUT_SEC", 120),

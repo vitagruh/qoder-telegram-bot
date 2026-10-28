@@ -9,6 +9,7 @@ Telegram-бот, который запускает задачи Qoder на Linux
 - `bot.py` — aiogram 3, long polling, команды и загрузка файлов
 - `qoder_runner.py` — обёртка над Qoder Agent SDK (`qoder-agent-sdk`): сессии, стриминг сообщений, прерывание
 - `approvals.py` — мост между запросами подтверждения SDK и inline-кнопками Telegram
+- `safe_commands.py` — проверка Bash-команд для автоподтверждения безопасного списка
 - `workspace.py` — изолированные директории задач: `WORKSPACE_ROOT/chat_<id>/tasks/<дата>-<slug>/`
 - `config.py` — конфигурация из окружения и `.env`
 
@@ -55,6 +56,7 @@ chmod 600 .env
 | `WORKSPACE_ROOT` | нет | корень рабочих директорий, по умолчанию `~/qoder-bot/workspace` |
 | `PERMISSION_MODE` | нет | `default` (всё опасное — по кнопке), `acceptEdits`, `plan`, `auto`, `dontAsk`, `bypassPermissions`, `yolo` |
 | `ALLOWED_TOOLS` | нет | что выполняется без подтверждения, по умолчанию `Read,Grep,Glob` |
+| `SAFE_BASH_MODE` | нет | `off` (по умолчанию), `readonly` — безопасные read-only Bash-команды без кнопки, `dev` — дополнительно тесты/сборка проекта |
 | `MAX_UPLOAD_MB` | нет | лимит загрузки, фактический максимум — 20 МБ (Bot API) |
 | `TASK_TIMEOUT_SEC` | нет | общий таймаут задачи, по умолчанию 1200 |
 | `APPROVAL_TIMEOUT_SEC` | нет | сколько ждать нажатия кнопки, по умолчанию 120; истечение = отказ |
@@ -190,6 +192,8 @@ journalctl --user -u qoder-bot -n 50 --no-pager
 
 Обычное сообщение — задача для Qoder в текущей директории; следующее сообщение продолжает ту же сессию. Документ или фото (до 20 МБ) сохраняется в `uploads/`; подпись к файлу становится запросом.
 
+После задачи файлы, созданные или изменённые в рабочей директории, автоматически отправляются в чат документами (до 10 файлов, каждый до 50 МБ; служебные каталоги вроде `.git`, `node_modules`, `__pycache__` пропускаются). Если файлов больше или они слишком большие, используйте `/files` и `/get`.
+
 ## Кнопки и расход
 
 - Постоянное меню под полем ввода: «Новая задача», «Статус», «Файлы», «Расход», «Отмена», «Помощь» — дублирует команды.
@@ -212,9 +216,24 @@ Qoder Agent SDK отдаёт **Credits** (`total_credits`, `usage.credits`), а 
 - Бот читает загруженные файлы через агента: содержимое файла может содержать инструкции для модели. Подтверждения остаются последним барьером, не отключайте их без изоляции.
 - PAT храните только в `.env` с правами `600`, не коммитьте его.
 
+### Безопасные Bash-команды
+
+При `SAFE_BASH_MODE=readonly` без кнопки выполняются только read-only команды, и только внутри директории задачи:
+
+- просмотр: `pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `du`, `df`, `tree`, `date`, `uname`, `whoami`, `id`, `which`, `hostname`, `echo`, `printf`, `tr`;
+- поиск и сравнение: `grep`, `rg`, `find` (без `-exec`, `-delete`, `-fprint`, `-L`), `diff`, `cmp`, `cut`, `sort`, `uniq`;
+- контрольные суммы: `sha256sum`, `sha1sum`, `md5sum`, `b2sum`;
+- git только чтение: `status`, `diff`, `log`, `show`, `branch --list`, `rev-parse`, `ls-files`, `blame`, `describe`, `cat-file`, `grep`, `shortlog`, `reflog show`;
+- проверка версий: `python --version`, `node --version`, `npm --version`, `pip --version`, `git --version`, `go version`, `cargo --version`, `rustc --version`, `java -version`, `gcc --version`, `make --version`, `cmake --version`.
+
+Ограничения: запрещены `;`, `&&`, `|`, перенаправления, подстановки `$()`/backticks и неэкранированные glob-символы; пути за пределы директории задачи отклоняются; у `git` проверяется локальный `.git/config` на `fsmonitor`, `textconv`, внешний diff и filter-хуки, а флаги `--output`, `--ext-diff`, `--textconv` и подобные не разрешены. Всё, что не прошло проверку, по-прежнему приходит с кнопками подтверждения.
+
+`SAFE_BASH_MODE=dev` дополнительно разрешает тесты и сборку: `pytest` / `python -m pytest`, `npm|yarn|pnpm test` и `run test|build|lint|check|typecheck`, `cargo test|build|check|clippy`, `go test|build|vet`, `make test|check|build|lint`, `mvn test|package|verify`, `gradle test|build|check`, `dotnet test|build`, `ruff check` / `ruff format --check`, `mypy`, `eslint` (без `--fix`), `tsc --noEmit`. Эти команды выполняют код проекта — включайте `dev` только для доверенных репозиториев.
+
 ## Ограничения текущей версии
 
 - Прогресс показывается по вызовам инструментов, без посимвольного стриминга.
 - Один активный запрос на чат; состояние (директория, session id, счётчики расхода) живёт в памяти и сбрасывается при перезапуске — после рестарта используйте `/new`.
 - Поддерживаются документы и фото; видео, аудио и голосовые не сохраняются.
+- Автоматически прикрепляются до 10 изменённых файлов; файлы больше 50 МБ и остальные доступны через `/files` и `/get`.
 - Расход считается по Credits из SDK; квота запрашивается один раз в конце задачи.

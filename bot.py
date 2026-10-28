@@ -43,6 +43,23 @@ log = logging.getLogger("qoder-bot")
 MAX_TEXT = 4000
 MAX_TELEGRAM_DOWNLOAD = 20 * 1024 * 1024
 MAX_TELEGRAM_UPLOAD = 50 * 1024 * 1024
+MAX_RESULT_FILES = 10
+RESULT_SKIP_PARTS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".qoder",
+        ".cache",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
 
 BTN_NEW = "🆕 Новая задача"
 BTN_STATUS = "📊 Статус"
@@ -84,7 +101,9 @@ HELP_TEXT = """🤖 Qoder Telegram Bot
 /usage — кредиты, квота, контекст
 /cancel — остановить выполнение
 
-Опасные операции (Bash, запись, сеть) требуют подтверждения кнопками.
+После задачи созданные и изменённые файлы приходят в чат вложениями.
+Безопасные read-only команды могут выполняться без подтверждения (SAFE_BASH_MODE),
+остальные опасные операции (Bash, запись, сеть) требуют подтверждения кнопками.
 Если агент задаёт вопрос, варианты приходят кнопками; свой ответ можно отправить текстом."""
 
 
@@ -200,6 +219,58 @@ def augment_prompt(prompt: str, files: list[str]) -> str:
         f"[Файлы, загруженные пользователем в рабочую директорию:\n{listing}\n"
         f"Прочитай их при необходимости.]"
     )
+
+
+def collect_result_files(
+    task_dir: Path,
+    since: float,
+    limit: int = MAX_RESULT_FILES,
+) -> list[tuple[Path, str, int]]:
+    root = task_dir.resolve()
+    found: list[tuple[float, Path, str, int]] = []
+    for relative, _ in recent_files(task_dir, since, limit=max(limit * 5, 50)):
+        rel_path = Path(relative)
+        if any(part in RESULT_SKIP_PARTS for part in rel_path.parts[:-1]):
+            continue
+        path = task_dir / rel_path
+        if path.is_symlink():
+            continue
+        try:
+            resolved = path.resolve()
+            stat = resolved.stat()
+        except OSError:
+            continue
+        if not resolved.is_file() or root not in resolved.parents:
+            continue
+        found.append((stat.st_mtime, resolved, relative, stat.st_size))
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [(path, relative, size) for _, path, relative, size in found[:limit]]
+
+
+async def send_result_files(
+    bot: Bot,
+    chat_id: int,
+    files: list[tuple[Path, str, int]],
+) -> None:
+    for path, relative, size in files:
+        if size > MAX_TELEGRAM_UPLOAD:
+            await bot.send_message(
+                chat_id,
+                f"📎 {relative} — {human_size(size)}, больше 50 МБ. "
+                "Скачайте через /get, уменьшив файл.",
+            )
+            continue
+        caption = f"📎 {relative} — {human_size(size)}"[:1000]
+        try:
+            await bot.send_document(
+                chat_id,
+                FSInputFile(path, filename=path.name),
+                caption=caption,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("send document failed for %s: %s", path, exc)
+            with contextlib.suppress(Exception):
+                await bot.send_message(chat_id, f"Не удалось отправить {relative}: {exc}")
 
 
 def usage_line(task: QoderTask, elapsed: float) -> str:
@@ -394,13 +465,15 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         elif not text:
             text = "✅ Готово, но Qoder не вернул текст."
 
-        changed = recent_files(task_dir, started)
+        changed = collect_result_files(task_dir, started)
         if changed:
-            listing = "\n".join(f"• {path} — {human_size(size)}" for path, size in changed)
-            text = f"{text}\n\n📝 Изменённые файлы:\n{listing}"
+            listing = "\n".join(f"• {relative} — {human_size(size)}" for _, relative, size in changed)
+            text = f"{text}\n\n📎 Прикрепляю файлы:\n{listing}"
 
         text = f"{text}\n\n─────\n{usage_line(task, elapsed)}"
         await finish_status(status, text)
+        if changed:
+            await send_result_files(message.bot, chat_id, changed)
 
     async def run_prompt(message: Message, prompt: str, files: list[str]) -> None:
         state = state_for(message.chat.id)
