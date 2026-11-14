@@ -36,6 +36,8 @@ class _Spec:
     value_path_flags: frozenset[str] = frozenset()
     path_args: bool = True
     max_nonflags: int | None = None
+    # Разрешает классические сокращения вида `git log -1`, `head -20`.
+    numeric_shorthand: bool = False
 
 
 def _has_unsafe_shell(command: str) -> bool:
@@ -130,6 +132,9 @@ def _parse_args(args: list[str], cwd: Path, spec: _Spec) -> list[str] | None:
             non_flags.extend(args[index + 1 :])
             break
         if arg.startswith("-") and arg != "-":
+            if spec.numeric_shorthand and arg[1:].isdigit():
+                index += 1
+                continue
             matched = _match_flag(arg, spec.flags, spec.value_flags)
             if matched is None:
                 return None
@@ -201,24 +206,21 @@ _READONLY_SPECS: dict[str, _Spec] = {
             "--zero-terminated", "--help", "--version",
         ),
         value_flags=_flag_set("-n", "--lines", "-c", "--bytes"),
+        numeric_shorthand=True,
     ),
     "tail": _Spec(
         flags=_flag_set(
-            "-f", "--follow", "-F", "--retry", "-q", "--quiet", "--silent",
-            "-v", "--verbose", "-z", "--zero-terminated", "--help", "--version",
+            "-q", "--quiet", "--silent", "-v", "--verbose", "-z",
+            "--zero-terminated", "--help", "--version",
         ),
-        value_flags=_flag_set(
-            "-n", "--lines", "-c", "--bytes", "-s", "--sleep-interval",
-            "--max-unchanged-stats", "--pid",
-        ),
+        value_flags=_flag_set("-n", "--lines", "-c", "--bytes"),
+        numeric_shorthand=True,
     ),
     "wc": _Spec(
         flags=_flag_set(
             "-c", "--bytes", "-m", "--chars", "-l", "--lines", "-w",
             "--words", "-L", "--max-line-length", "--help", "--version",
         ),
-        value_flags=_flag_set("--files0-from"),
-        value_path_flags=_flag_set("--files0-from"),
     ),
     "grep": _Spec(
         flags=_flag_set(
@@ -284,10 +286,10 @@ _READONLY_SPECS: dict[str, _Spec] = {
             "--apple", "--version", "--help",
         ),
         value_flags=_flag_set(
-            "-m", "--magic-file", "-f", "--files-from", "-e", "--exclude",
+            "-m", "--magic-file", "-e", "--exclude",
             "-F", "--separator", "-P", "--parameter", "-E", "--extension",
         ),
-        value_path_flags=_flag_set("-m", "--magic-file", "-f", "--files-from"),
+        value_path_flags=_flag_set("-m", "--magic-file"),
     ),
     "stat": _Spec(
         flags=_flag_set(
@@ -382,11 +384,7 @@ _READONLY_SPECS: dict[str, _Spec] = {
         ),
         value_flags=_flag_set(
             "-k", "--key", "-t", "--field-separator", "-S", "--buffer-size",
-            "--files0-from", "--random-source", "--batch-size",
-            "--parallel", "--sort", "--temporary-directory", "-T",
-        ),
-        value_path_flags=_flag_set(
-            "--files0-from", "--random-source", "--temporary-directory", "-T",
+            "--batch-size", "--parallel", "--sort",
         ),
     ),
     "uniq": _Spec(
@@ -558,6 +556,9 @@ _FIND_DANGEROUS = frozenset(
         "-fprint0",
         "-fprintf",
         "-fls",
+        # Списки путей из файла обходят проверку _within: содержимое
+        # нельзя проверить статически, поэтому запрещаем целиком.
+        "-files0-from",
         "-L",
         "-H",
         "-follow",
@@ -565,7 +566,7 @@ _FIND_DANGEROUS = frozenset(
     }
 )
 _FIND_PATH_PRIMARIES = frozenset(
-    {"-newer", "-anewer", "-cnewer", "-samefile", "-files0-from"}
+    {"-newer", "-anewer", "-cnewer", "-samefile"}
 )
 
 
@@ -586,7 +587,7 @@ def _validate_find(args: list[str], cwd: Path) -> bool:
         token = args[index]
         if token in _FIND_DANGEROUS:
             return False
-        if token.startswith(("-fprint", "-fprintf", "-fls")):
+        if token.startswith(("-fprint", "-fprintf", "-fls", "-files0-from")):
             return False
         if token in _FIND_PATH_PRIMARIES:
             if index + 1 >= len(args) or not _within(args[index + 1], cwd):
@@ -707,7 +708,7 @@ def _validate_make(args: list[str], cwd: Path) -> bool:
         "-C", "--directory", "-f", "--file", "-I", "--include-dir",
     }
     value_flags = path_value_flags | {
-        "-j", "--jobs", "-l", "--load-average", "-O", "--output-sync",
+        "-l", "--load-average", "-O", "--output-sync",
         "-o", "--old-file", "-W", "--what-if", "--new-file",
         "--assume-old", "--assume-new", "--debug", "--shuffle",
     }
@@ -715,6 +716,20 @@ def _validate_make(args: list[str], cwd: Path) -> bool:
         arg = args[index]
         if arg in {"-t", "--touch", "--eval"} or arg.startswith(("-E", "--eval=")):
             return False
+        # `-j`/`--jobs` — необязательный аргумент: `make -j`, `make -j8`,
+        # `make -j 8` и `make --jobs=8` все валидны.
+        if arg in {"-j", "--jobs"}:
+            if index + 1 < len(args) and args[index + 1].isdigit():
+                index += 2
+            else:
+                index += 1
+            continue
+        if arg.startswith(("-j", "--jobs=")):
+            value = arg[len("--jobs=") :] if arg.startswith("--jobs=") else arg[2:]
+            if not value.isdigit():
+                return False
+            index += 1
+            continue
         if arg.startswith("--") and "=" in arg:
             flag, value = arg.split("=", 1)
             if flag in path_value_flags and not _within(value, cwd):
@@ -958,11 +973,13 @@ _GIT_SPECS: dict[str, _Spec] = {
         flags=_GIT_LOG_FLAGS,
         value_flags=_GIT_LOG_VALUE_FLAGS,
         value_path_flags=_GIT_LOG_VALUE_PATH_FLAGS,
+        numeric_shorthand=True,
     ),
     "show": _Spec(
         flags=_GIT_LOG_FLAGS,
         value_flags=_GIT_LOG_VALUE_FLAGS,
         value_path_flags=_GIT_LOG_VALUE_PATH_FLAGS,
+        numeric_shorthand=True,
     ),
     "rev-parse": _Spec(
         flags=_GIT_REV_PARSE_FLAGS,

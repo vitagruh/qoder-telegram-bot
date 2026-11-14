@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -10,6 +12,10 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+log = logging.getLogger("qoder-bot")
+
+QUESTION_GRACE_SEC = 60.0
 
 
 class Decision(str, Enum):
@@ -22,6 +28,8 @@ class Decision(str, Enum):
 class _Pending:
     future: asyncio.Future[Decision]
     chat_id: int
+    user_id: int | None
+    tool: str
     header: str
     message_id: int | None = None
 
@@ -30,6 +38,7 @@ class _Pending:
 class _AskFlow:
     chat_id: int
     queue: asyncio.Queue[tuple[str, Any]]
+    timed_out: bool = False
 
 
 class ApprovalManager:
@@ -41,6 +50,7 @@ class ApprovalManager:
         self._pending: dict[str, _Pending] = {}
         self._ask_flows: dict[str, _AskFlow] = {}
         self._text_targets: dict[int, str] = {}
+        self._expired_questions: dict[int, float] = {}
 
     async def request(
         self,
@@ -48,6 +58,8 @@ class ApprovalManager:
         tool_name: str,
         input_data: dict[str, Any],
         context: Any,
+        user_id: int | None = None,
+        allow_session: bool = True,
     ) -> Decision:
         signal = getattr(context, "signal", None)
         if signal is not None and getattr(signal, "is_set", lambda: False)():
@@ -57,27 +69,38 @@ class ApprovalManager:
         pending = _Pending(
             future=asyncio.get_running_loop().create_future(),
             chat_id=chat_id,
+            user_id=user_id,
+            tool=tool_name,
             header=self._header(tool_name, input_data, context),
         )
         self._pending[request_id] = pending
         try:
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="✅ Разрешить",
-                            callback_data=f"apv:{request_id}:allow",
-                        ),
-                        InlineKeyboardButton(
-                            text="♾ В сессии",
-                            callback_data=f"apv:{request_id}:always",
-                        ),
-                        InlineKeyboardButton(
-                            text="⛔ Отклонить",
-                            callback_data=f"apv:{request_id}:deny",
-                        ),
-                    ]
-                ]
+            buttons = [
+                InlineKeyboardButton(
+                    text="✅ Разрешить",
+                    callback_data=f"apv:{request_id}:allow",
+                )
+            ]
+            if allow_session:
+                buttons.append(
+                    InlineKeyboardButton(
+                        text="♾ В сессии",
+                        callback_data=f"apv:{request_id}:always",
+                    )
+                )
+            buttons.append(
+                InlineKeyboardButton(
+                    text="⛔ Отклонить",
+                    callback_data=f"apv:{request_id}:deny",
+                )
+            )
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons])
+            log.info(
+                "approval requested: tool=%s chat=%s user=%s session=%s",
+                tool_name,
+                chat_id,
+                user_id,
+                allow_session,
             )
             sent = await self._bot.send_message(chat_id, pending.header, reply_markup=keyboard)
             pending.message_id = sent.message_id
@@ -118,11 +141,39 @@ class ApprovalManager:
         finally:
             self._pending.pop(request_id, None)
 
-    def resolve(self, request_id: str, decision: Decision) -> bool:
+    def resolve(
+        self,
+        request_id: str,
+        decision: Decision,
+        *,
+        chat_id: int | None = None,
+        user_id: int | None = None,
+    ) -> bool:
         pending = self._pending.get(request_id)
         if pending is None or pending.future.done():
             return False
+        if chat_id is not None and pending.chat_id != chat_id:
+            log.warning(
+                "approval rejected: request from chat %s, callback from chat %s",
+                pending.chat_id,
+                chat_id,
+            )
+            return False
+        if user_id is not None and pending.user_id is not None and pending.user_id != user_id:
+            log.warning(
+                "approval rejected: request by user %s, callback from user %s",
+                pending.user_id,
+                user_id,
+            )
+            return False
         pending.future.set_result(decision)
+        log.info(
+            "approval decided: tool=%s chat=%s user=%s decision=%s",
+            pending.tool,
+            pending.chat_id,
+            pending.user_id,
+            decision.value,
+        )
         return True
 
     async def cancel_all(self, chat_id: int | None = None) -> None:
@@ -155,6 +206,10 @@ class ApprovalManager:
             self._ask_flows.pop(request_id, None)
             if self._text_targets.get(chat_id) == request_id:
                 self._text_targets.pop(chat_id, None)
+            if flow.timed_out:
+                # Не даём ответу, отправленному после таймаута, молча
+                # превратиться в новую задачу Qoder.
+                self._expired_questions[chat_id] = time.monotonic()
 
     def consume_text(self, chat_id: int, text: str) -> bool:
         request_id = self._text_targets.get(chat_id)
@@ -164,13 +219,29 @@ class ApprovalManager:
         flow.queue.put_nowait(("text", text))
         return True
 
-    def handle_ask_callback(self, callback_data: str) -> bool:
+    def question_expired(self, chat_id: int) -> bool:
+        created = self._expired_questions.pop(chat_id, None)
+        return created is not None and time.monotonic() - created <= QUESTION_GRACE_SEC
+
+    def handle_ask_callback(
+        self,
+        callback_data: str,
+        *,
+        chat_id: int | None = None,
+    ) -> bool:
         parts = callback_data.split(":")
         if len(parts) != 4:
             return False
         _, request_id, action, raw = parts
         flow = self._ask_flows.get(request_id)
         if flow is None:
+            return False
+        if chat_id is not None and flow.chat_id != chat_id:
+            log.warning(
+                "ask callback rejected: question in chat %s, callback from chat %s",
+                flow.chat_id,
+                chat_id,
+            )
             return False
         try:
             index = int(raw)
@@ -198,9 +269,18 @@ class ApprovalManager:
             try:
                 action, index = await asyncio.wait_for(flow.queue.get(), timeout=self._timeout)
             except asyncio.TimeoutError:
+                flow.timed_out = True
+                await self._close_question(
+                    flow.chat_id,
+                    message_id,
+                    body,
+                    "⏱ Время ожидания истекло",
+                    mark="⏱",
+                )
                 return None
 
             if action == "cancel":
+                await self._close_question(flow.chat_id, message_id, body, "Отменено", mark="⛔")
                 return None
             if action == "select" and 0 <= index < len(options):
                 answer = str(options[index].get("label", index + 1))
@@ -271,12 +351,19 @@ class ApprovalManager:
             lines.append("Выберите вариант или отправьте свой ответ текстом.")
         return "\n".join(lines)[:3900]
 
-    async def _close_question(self, chat_id: int, message_id: int, body: str, answer: str) -> None:
+    async def _close_question(
+        self,
+        chat_id: int,
+        message_id: int,
+        body: str,
+        answer: str,
+        mark: str = "✅",
+    ) -> None:
         with contextlib.suppress(Exception):
             await self._bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"{body}\n\n✅ {answer}"[:3900],
+                text=f"{body}\n\n{mark} {answer}"[:3900],
                 reply_markup=None,
             )
 
@@ -285,6 +372,10 @@ class ApprovalManager:
         description = getattr(context, "description", None)
         if description:
             lines.append(str(description))
+        if tool_name.casefold() in {"webfetch", "websearch"}:
+            target = input_data.get("url") or input_data.get("query")
+            if target:
+                lines.append(f"🌐 {str(target)[:1500]}")
         try:
             payload = json.dumps(input_data, ensure_ascii=False, indent=2)
         except (TypeError, ValueError):
@@ -305,5 +396,5 @@ class ApprovalManager:
                 text=f"{pending.header}\n\n{note}"[:3900],
                 reply_markup=None,
             )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - сообщение могло быть удалено
+            log.debug("approval message update failed: %s", exc)
