@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -29,6 +32,7 @@ from approvals import ApprovalManager, Decision
 from config import Config, load_config
 from qoder_runner import QoderTask
 from workspace import (
+    SKIP_DIRS,
     create_task_dir,
     human_size,
     iter_files,
@@ -44,22 +48,7 @@ MAX_TEXT = 4000
 MAX_TELEGRAM_DOWNLOAD = 20 * 1024 * 1024
 MAX_TELEGRAM_UPLOAD = 50 * 1024 * 1024
 MAX_RESULT_FILES = 10
-RESULT_SKIP_PARTS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".qoder",
-        ".cache",
-        ".venv",
-        "venv",
-        "node_modules",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-    }
-)
+RESULT_SKIP_PARTS = SKIP_DIRS
 
 BTN_NEW = "🆕 Новая задача"
 BTN_STATUS = "📊 Статус"
@@ -112,7 +101,9 @@ class ChatState:
     task_dir: Path | None = None
     session_id: str | None = None
     task: QoderTask | None = None
+    run_task: asyncio.Task[None] | None = None
     busy: bool = False
+    cancel_requested: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tasks_done: int = 0
     credits_total: float = 0.0
@@ -392,65 +383,98 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
 
     async def do_cancel(message: Message) -> None:
         state = state_for(message.chat.id)
-        if state.task is None:
+        if state.task is None and state.run_task is None:
             await message.answer("Нечего отменять.")
             return
-        await state.task.interrupt()
+        state.cancel_requested = True
+        if state.task is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(state.task.interrupt(), timeout=3)
         await approvals.cancel_all(message.chat.id)
-        await message.answer("⏹ Отправляю сигнал остановки.")
+        run_task = state.run_task
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+        await message.answer("⏹ Останавливаю задачу.")
 
     async def do_help(message: Message) -> None:
         await message.answer(HELP_TEXT, reply_markup=MENU)
 
     async def finish_status(status: Message, text: str) -> None:
+        bot = cast(Bot, status.bot)
         chunks = split_text(text) or ["✅ Готово."]
         try:
             await status.edit_text(chunks[0], reply_markup=result_keyboard())
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc):
+                await bot.send_message(status.chat.id, chunks[0], reply_markup=result_keyboard())
         except Exception:
-            await status.bot.send_message(status.chat.id, chunks[0], reply_markup=result_keyboard())
+            await bot.send_message(status.chat.id, chunks[0], reply_markup=result_keyboard())
         for chunk in chunks[1:]:
-            await status.bot.send_message(status.chat.id, chunk)
+            await bot.send_message(status.chat.id, chunk)
 
     async def execute(message: Message, state: ChatState, prompt: str, files: list[str]) -> None:
         chat_id = message.chat.id
+        bot = cast(Bot, message.bot)
         task_dir = ensure_task_dir(chat_id, prompt)
-        started = time.time()
+        started_wall = time.time()
+        started_mono = time.monotonic()
         status = await message.answer("⏳ Запускаю Qoder…", reply_markup=status_keyboard())
         update_status = make_status_editor(status)
-        typing = asyncio.create_task(keep_typing(message.bot, chat_id))
+        typing = asyncio.create_task(keep_typing(bot, chat_id))
+        user_id = message.from_user.id if message.from_user else None
 
         task = QoderTask(
             config=cfg,
             cwd=task_dir,
             prompt=augment_prompt(prompt, files),
             session_id=state.session_id,
-            approve=lambda tool, data, context: approvals.request(chat_id, tool, data, context),
+            approve=lambda tool, data, context, allow_session: approvals.request(
+                chat_id,
+                tool,
+                data,
+                context,
+                user_id=user_id,
+                allow_session=allow_session,
+            ),
             ask=lambda questions: approvals.ask(chat_id, questions),
             on_tool=lambda tool: update_status(f"⚙️ {tool}\n⏳ Работаю…"),
         )
         state.task = task
+        state.cancel_requested = False
+        run_task = asyncio.create_task(task.run())
+        state.run_task = run_task
 
         error: str | None = None
         try:
-            await asyncio.wait_for(task.run(), timeout=cfg.task_timeout_sec)
+            await asyncio.wait_for(run_task, timeout=cfg.task_timeout_sec)
         except asyncio.TimeoutError:
             error = f"⏱ Превышен лимит {cfg.task_timeout_sec} с — задача остановлена."
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(task.interrupt(), timeout=3)
             await approvals.cancel_all(chat_id)
         except asyncio.CancelledError:
+            if not state.cancel_requested:
+                raise
             error = "⏹ Задача остановлена."
             await approvals.cancel_all(chat_id)
         except Exception as exc:  # noqa: BLE001
             log.exception("Qoder task failed")
             error = f"❌ Ошибка Qoder: {exc}"
         finally:
+            if not run_task.done():
+                run_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_task
+            state.run_task = None
+            state.task = None
+            state.cancel_requested = False
             typing.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await typing
-            state.task = None
             if task.session_id:
                 state.session_id = task.session_id
 
-        elapsed = time.time() - started
+        elapsed = time.monotonic() - started_mono
         state.tasks_done += 1
         state.credits_total += task.request_credits
         state.last_seconds = elapsed
@@ -465,7 +489,7 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         elif not text:
             text = "✅ Готово, но Qoder не вернул текст."
 
-        changed = collect_result_files(task_dir, started)
+        changed = collect_result_files(task_dir, started_wall)
         if changed:
             listing = "\n".join(f"• {relative} — {human_size(size)}" for _, relative, size in changed)
             text = f"{text}\n\n📎 Прикрепляю файлы:\n{listing}"
@@ -473,7 +497,7 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         text = f"{text}\n\n─────\n{usage_line(task, elapsed)}"
         await finish_status(status, text)
         if changed:
-            await send_result_files(message.bot, chat_id, changed)
+            await send_result_files(bot, chat_id, changed)
 
     async def run_prompt(message: Message, prompt: str, files: list[str]) -> None:
         state = state_for(message.chat.id)
@@ -575,27 +599,33 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         limit = min(cfg.max_upload_mb * 1024 * 1024, MAX_TELEGRAM_DOWNLOAD)
         if size > limit:
             await message.answer(
-                f"Файл больше {cfg.max_upload_mb} МБ — Telegram Bot API не отдаст его боту."
+                f"Файл больше {human_size(limit)} — Telegram Bot API не отдаст его боту."
             )
             return
 
         task_dir = ensure_task_dir(message.chat.id, (message.caption or "upload").strip())
         uploads = task_dir / "uploads"
-        uploads.mkdir(parents=True, exist_ok=True)
+        uploads.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         original = getattr(file, "file_name", None) or f"photo_{int(time.time())}.jpg"
         destination = unique_path(uploads, sanitize_filename(original))
         try:
-            buffer = await message.bot.download(file)
+            await cast(Bot, message.bot).download(file, destination=destination)
         except Exception as exc:  # noqa: BLE001
             log.warning("download failed: %s", exc)
-            await message.answer("Не удалось скачать файл из Telegram.")
-            return
-        if buffer is None:
+            destination.unlink(missing_ok=True)
             await message.answer("Не удалось скачать файл из Telegram.")
             return
 
-        destination.write_bytes(buffer.getvalue())
+        try:
+            actual_size = destination.stat().st_size
+        except OSError:
+            actual_size = 0
+        if actual_size > limit:
+            destination.unlink(missing_ok=True)
+            await message.answer(f"Файл больше {human_size(limit)} — загрузка отменена.")
+            return
+
         relative = destination.relative_to(task_dir).as_posix()
 
         caption = (message.caption or "").strip()
@@ -618,6 +648,12 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         if approvals.consume_text(message.chat.id, prompt):
             await message.answer("✍️ Ответ отправлен агенту.")
             return
+        if approvals.question_expired(message.chat.id):
+            await message.answer(
+                "⏱ Вопрос уже истёк — ответ не отправлен. "
+                "Повторите запрос, если он ещё актуален."
+            )
+            return
         await run_prompt(message, prompt, [])
 
     @router.callback_query(F.data.startswith("apv:"))
@@ -632,14 +668,19 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         except ValueError:
             await cb.answer()
             return
-        if approvals.resolve(request_id, decision):
+        message = cb.message
+        chat_id = message.chat.id if isinstance(message, Message) else None
+        user_id = cb.from_user.id if cb.from_user else None
+        if approvals.resolve(request_id, decision, chat_id=chat_id, user_id=user_id):
             await cb.answer("Принято")
         else:
-            await cb.answer("Запрос уже неактуален", show_alert=True)
+            await cb.answer("Запрос уже неактуален или недоступен", show_alert=True)
 
     @router.callback_query(F.data.startswith("ask:"))
     async def on_ask(cb: CallbackQuery) -> None:
-        if approvals.handle_ask_callback(cb.data or ""):
+        message = cb.message
+        chat_id = message.chat.id if isinstance(message, Message) else None
+        if approvals.handle_ask_callback(cb.data or "", chat_id=chat_id):
             await cb.answer()
         else:
             await cb.answer("Вопрос уже неактуален", show_alert=True)
@@ -665,11 +706,12 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
 
 
 async def main() -> None:
+    cfg = load_config()
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, level_name, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    cfg = load_config()
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=None))
     dp = Dispatcher()
     approvals = ApprovalManager(bot, cfg.approval_timeout_sec)
@@ -678,12 +720,35 @@ async def main() -> None:
     dp.callback_query.middleware(middleware)
     dp.include_router(build_router(cfg, approvals, {}))
 
-    with contextlib.suppress(Exception):
+    async def on_error(event: ErrorEvent) -> bool:
+        exc = event.exception
+        log.error(
+            "Unhandled update error: %s",
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        update = event.update
+        message = update.message
+        if message is None and update.callback_query is not None:
+            candidate = update.callback_query.message
+            if isinstance(candidate, Message):
+                message = candidate
+        if isinstance(message, Message):
+            with contextlib.suppress(Exception):
+                await message.answer("❌ Внутренняя ошибка. Попробуйте ещё раз, детали в логах.")
+        return True
+
+    dp.errors.register(on_error)
+
+    try:
         await bot.set_my_commands(BOT_COMMANDS)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("set_my_commands failed: %s", exc)
 
     log.info("workspace: %s", cfg.workspace_root)
     log.info("permission mode: %s", cfg.permission_mode)
-    await dp.start_polling(bot)
+    log.info("always confirm: %s", ", ".join(sorted(cfg.confirm_tools)))
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from safe_commands import SAFE_BASH_MODES
+
+log = logging.getLogger("qoder-bot")
+
+# Эти инструменты всегда требуют ручного подтверждения. Их нельзя
+# включить в ALLOWED_TOOLS и нельзя разрешить «на сессию».
+MANDATORY_CONFIRM_TOOLS = frozenset({"WebFetch", "WebSearch"})
 
 PERMISSION_MODES = {
     "default",
@@ -58,6 +65,18 @@ def _ids(name: str) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _tools(name: str, default: str = "") -> frozenset[str]:
+    return frozenset(
+        part.strip()
+        for part in re.split(r"[,\s]+", os.getenv(name, default))
+        if part.strip()
+    )
+
+
+def _folded(values: frozenset[str]) -> frozenset[str]:
+    return frozenset(value.casefold() for value in values)
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -65,11 +84,15 @@ class Config:
     workspace_root: Path
     permission_mode: str
     allowed_tools: tuple[str, ...]
+    confirm_tools: frozenset[str]
     safe_bash_mode: str
     max_upload_mb: int
     task_timeout_sec: int
     approval_timeout_sec: int
     qoder_config_dir: str | None
+
+    def requires_confirmation(self, tool_name: str) -> bool:
+        return tool_name.casefold() in _folded(self.confirm_tools)
 
 
 def load_config() -> Config:
@@ -98,6 +121,15 @@ def load_config() -> Config:
         for item in os.getenv("ALLOWED_TOOLS", "Read,Grep,Glob").split(",")
         if item.strip()
     )
+    confirm_tools = MANDATORY_CONFIRM_TOOLS | _tools("ALWAYS_CONFIRM_TOOLS")
+    confirm_folded = _folded(confirm_tools)
+    auto_tools = tuple(tool for tool in tools if tool.casefold() not in confirm_folded)
+    removed = sorted(set(tools) - set(auto_tools))
+    if removed:
+        log.warning(
+            "ALLOWED_TOOLS: %s всегда требуют подтверждения и исключены из автозапуска",
+            ", ".join(removed),
+        )
 
     safe_bash_mode = os.getenv("SAFE_BASH_MODE", "off").strip().lower() or "off"
     if safe_bash_mode not in SAFE_BASH_MODES:
@@ -114,7 +146,8 @@ def load_config() -> Config:
         allowed_user_ids=allowed,
         workspace_root=root,
         permission_mode=mode,
-        allowed_tools=tools,
+        allowed_tools=auto_tools,
+        confirm_tools=confirm_tools,
         safe_bash_mode=safe_bash_mode,
         max_upload_mb=_int("MAX_UPLOAD_MB", 20),
         task_timeout_sec=_int("TASK_TIMEOUT_SEC", 1200),

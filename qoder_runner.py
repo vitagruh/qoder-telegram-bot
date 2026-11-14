@@ -21,7 +21,8 @@ from qoder_agent_sdk import (
 )
 
 from approvals import Decision
-from config import Config
+from config import Config, MANDATORY_CONFIRM_TOOLS
+from env_policy import build_child_env
 from safe_commands import is_safe_command
 
 log = logging.getLogger("qoder-bot")
@@ -30,7 +31,7 @@ log = logging.getLogger("qoder-bot")
 # или изображения обрывает задачу с "maximum buffer size".
 MAX_BUFFER_SIZE = 32 * 1024 * 1024
 
-Approver = Callable[[str, dict[str, Any], Any], Awaitable[Decision]]
+Approver = Callable[[str, dict[str, Any], Any, bool], Awaitable[Decision]]
 ToolObserver = Callable[[str], Awaitable[None]]
 Questioner = Callable[[list[dict[str, Any]]], Awaitable[dict[str, str] | None]]
 
@@ -93,12 +94,16 @@ class QoderTask:
         if self.session_id:
             options_kwargs["resume"] = self.session_id
         if self._config.permission_mode in {"bypassPermissions", "yolo"}:
+            log.warning(
+                "PERMISSION_MODE=%s отключает все подтверждения, "
+                "включая WebFetch/WebSearch. Используйте только в изоляции.",
+                self._config.permission_mode,
+            )
             options_kwargs["allow_dangerously_skip_permissions"] = True
-        if self._config.qoder_config_dir:
-            options_kwargs["env"] = {
-                **os.environ,
-                "QODER_CONFIG_DIR": self._config.qoder_config_dir,
-            }
+
+        # В дочерний процесс не попадают токен бота и прочие секреты
+        # родительского окружения; см. env_policy.py.
+        options_kwargs["env"] = build_child_env(self._config.qoder_config_dir)
 
         options = QoderAgentOptions(**options_kwargs)
         async with QoderSDKClient(options=options) as client:
@@ -157,17 +162,19 @@ class QoderTask:
                 setattr(self, attribute, getattr(self, attribute) + int(value))
 
     async def _collect_usage(self, client: QoderSDKClient) -> None:
-        try:
-            info = await asyncio.wait_for(client.get_usage_info(), timeout=5)
-        except Exception:
-            info = None
+        async def fetch(coro: Awaitable[Any], label: str) -> Any:
+            try:
+                return await asyncio.wait_for(coro, timeout=5)
+            except Exception as exc:  # noqa: BLE001 - использование не критично
+                log.debug("%s недоступен: %s", label, exc)
+                return None
+
+        info, context = await asyncio.gather(
+            fetch(client.get_usage_info(), "usage info"),
+            fetch(client.get_context_usage(), "context usage"),
+        )
         if isinstance(info, dict):
             self.usage_info = info
-
-        try:
-            context = await asyncio.wait_for(client.get_context_usage(), timeout=5)
-        except Exception:
-            context = None
         if isinstance(context, dict):
             self.context_usage = context
 
@@ -193,8 +200,17 @@ class QoderTask:
                 updated_input={"questions": questions, "answers": answers}
             )
 
+        allow_session = True
+        if self._config.requires_confirmation(tool_name):
+            # Сетевые (и добавленные через ALWAYS_CONFIRM_TOOLS) инструменты
+            # подтверждаются всегда, «на сессию» для них не предлагаем.
+            allow_session = tool_name.casefold() not in {
+                item.casefold() for item in MANDATORY_CONFIRM_TOOLS
+            }
+
         if (
             tool_name == "Bash"
+            and not self._config.requires_confirmation(tool_name)
             and self._config.safe_bash_mode != "off"
             and not input_data.get("dangerouslyDisableSandbox")
         ):
@@ -208,7 +224,7 @@ class QoderTask:
                 return PermissionResultAllow(updated_input=input_data)
 
         try:
-            decision = await self._approve(tool_name, input_data, context)
+            decision = await self._approve(tool_name, input_data, context, allow_session)
         except Exception:
             return PermissionResultDeny(message="Не удалось получить подтверждение пользователя.")
 
@@ -217,7 +233,9 @@ class QoderTask:
         if decision is Decision.ALWAYS:
             return PermissionResultAllow(
                 updated_input=input_data,
-                updated_permissions=getattr(context, "suggestions", None),
+                updated_permissions=(
+                    getattr(context, "suggestions", None) if allow_session else None
+                ),
             )
         return PermissionResultDeny(message="Пользователь отклонил операцию.")
 
@@ -227,5 +245,5 @@ class QoderTask:
             return
         try:
             await client.interrupt()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("interrupt failed: %s", exc)
