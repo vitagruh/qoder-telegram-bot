@@ -11,3 +11,17 @@ exclude = [".venv", "venv"]
 # Консервативный набор: ошибки синтаксиса/импортов и неопределённые имена.
 # Дополнительные правила можно включать постепенно.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "bot.py",
+    "qoder_runner.py",
+    "approvals.py",
+    "config.py",
+    "workspace.py",
+    "safe_commands.py",
+    "env_policy.py",
+]
+# Сторонние пакеты (aiogram, qoder-agent-sdk) не всегда поставляют полные стабы.
+ignore_missing_imports = true

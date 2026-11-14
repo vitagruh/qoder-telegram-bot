@@ -915,7 +915,7 @@ _GIT_CAT_FILE_FLAGS = _flag_set(
     "--batch-all-objects", "--buffer", "--unordered",
     "--allow-unknown-type", "--help",
 )
-_GIT_CAT_FILE_VALUE_FLAGS = frozenset()
+_GIT_CAT_FILE_VALUE_FLAGS: frozenset[str] = frozenset()
 
 _GIT_GREP_FLAGS = _flag_set(
     "--cached", "--no-index", "--untracked", "--exclude-standard",

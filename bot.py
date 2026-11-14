@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -400,29 +400,27 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         await message.answer(HELP_TEXT, reply_markup=MENU)
 
     async def finish_status(status: Message, text: str) -> None:
+        bot = cast(Bot, status.bot)
         chunks = split_text(text) or ["✅ Готово."]
         try:
             await status.edit_text(chunks[0], reply_markup=result_keyboard())
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc):
-                await status.bot.send_message(
-                    status.chat.id, chunks[0], reply_markup=result_keyboard()
-                )
+                await bot.send_message(status.chat.id, chunks[0], reply_markup=result_keyboard())
         except Exception:
-            await status.bot.send_message(
-                status.chat.id, chunks[0], reply_markup=result_keyboard()
-            )
+            await bot.send_message(status.chat.id, chunks[0], reply_markup=result_keyboard())
         for chunk in chunks[1:]:
-            await status.bot.send_message(status.chat.id, chunk)
+            await bot.send_message(status.chat.id, chunk)
 
     async def execute(message: Message, state: ChatState, prompt: str, files: list[str]) -> None:
         chat_id = message.chat.id
+        bot = cast(Bot, message.bot)
         task_dir = ensure_task_dir(chat_id, prompt)
         started_wall = time.time()
         started_mono = time.monotonic()
         status = await message.answer("⏳ Запускаю Qoder…", reply_markup=status_keyboard())
         update_status = make_status_editor(status)
-        typing = asyncio.create_task(keep_typing(message.bot, chat_id))
+        typing = asyncio.create_task(keep_typing(bot, chat_id))
         user_id = message.from_user.id if message.from_user else None
 
         task = QoderTask(
@@ -499,7 +497,7 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         text = f"{text}\n\n─────\n{usage_line(task, elapsed)}"
         await finish_status(status, text)
         if changed:
-            await send_result_files(message.bot, chat_id, changed)
+            await send_result_files(bot, chat_id, changed)
 
     async def run_prompt(message: Message, prompt: str, files: list[str]) -> None:
         state = state_for(message.chat.id)
@@ -612,7 +610,7 @@ def build_router(cfg: Config, approvals: ApprovalManager, states: dict[int, Chat
         original = getattr(file, "file_name", None) or f"photo_{int(time.time())}.jpg"
         destination = unique_path(uploads, sanitize_filename(original))
         try:
-            await message.bot.download(file, destination=destination)
+            await cast(Bot, message.bot).download(file, destination=destination)
         except Exception as exc:  # noqa: BLE001
             log.warning("download failed: %s", exc)
             destination.unlink(missing_ok=True)
@@ -732,7 +730,9 @@ async def main() -> None:
         update = event.update
         message = update.message
         if message is None and update.callback_query is not None:
-            message = update.callback_query.message
+            candidate = update.callback_query.message
+            if isinstance(candidate, Message):
+                message = candidate
         if isinstance(message, Message):
             with contextlib.suppress(Exception):
                 await message.answer("❌ Внутренняя ошибка. Попробуйте ещё раз, детали в логах.")

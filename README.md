@@ -244,12 +244,13 @@ Qoder Agent SDK отдаёт **Credits** (`total_credits`, `usage.credits`), а 
 ## Разработка и тесты
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m ruff check .
+python -m mypy
 python -m pytest -q
 ```
 
-Тесты не требуют установленных `aiogram`/`qoder-agent-sdk`: проверяются валидатор Bash-команд, изоляция путей, политика окружения и правила подтверждений. CI запускает их на Python 3.10 и 3.12.
+Тесты проверяют валидатор Bash-команд, изоляцию путей, политику окружения, подтверждения и вспомогательные функции бота. Для части тестов нужны `aiogram` и `qoder-agent-sdk`, поэтому ставьте зависимости приложения. CI прогоняет линтер, mypy и тесты на Python 3.10 и 3.12.
 
 ## Ограничения текущей версии
 
