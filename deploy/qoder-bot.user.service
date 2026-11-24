@@ -1,14 +1,23 @@
 [Unit]
 Description=Qoder Telegram bot (user service)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h/qoder-telegram-bot
 EnvironmentFile=-%h/qoder-telegram-bot/.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/qoder-telegram-bot/.venv/bin/python %h/qoder-telegram-bot/bot.py
-Restart=on-failure
+Restart=always
 RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=default.target

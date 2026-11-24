@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from qoder_agent_sdk import (
     AssistantMessage,
+    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     QoderAgentOptions,
@@ -21,16 +22,38 @@ from qoder_agent_sdk import (
 )
 
 from approvals import Decision
-from config import Config
+from config import NETWORK_TOOLS, Config
+from env_policy import build_child_env
 from safe_commands import is_safe_command
+from tool_policy import FILE_TOOLS, evaluate_tool
 
 log = logging.getLogger("qoder-bot")
+
+# Matcher PreToolUse-хука: только файловые инструменты, которые должны
+# проверяться на выход за пределы cwd. Для остальных действует can_use_tool.
+FILE_TOOL_MATCHER = "|".join(sorted(FILE_TOOLS))
+
+
+def _hook_output(
+    decision: str,
+    reason: str | None = None,
+    updated_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+    }
+    if reason:
+        output["permissionDecisionReason"] = reason
+    if updated_input is not None:
+        output["updatedInput"] = updated_input
+    return {"hookSpecificOutput": output}
 
 # SDK по умолчанию читает не больше 1 МиБ на сообщение: один Read большого файла
 # или изображения обрывает задачу с "maximum buffer size".
 MAX_BUFFER_SIZE = 32 * 1024 * 1024
 
-Approver = Callable[[str, dict[str, Any], Any], Awaitable[Decision]]
+Approver = Callable[[str, dict[str, Any], Any, bool], Awaitable[Decision]]
 ToolObserver = Callable[[str], Awaitable[None]]
 Questioner = Callable[[list[dict[str, Any]]], Awaitable[dict[str, str] | None]]
 
@@ -93,12 +116,25 @@ class QoderTask:
         if self.session_id:
             options_kwargs["resume"] = self.session_id
         if self._config.permission_mode in {"bypassPermissions", "yolo"}:
+            log.warning(
+                "PERMISSION_MODE=%s отключает все подтверждения, "
+                "включая WebFetch/WebSearch. Используйте только в изоляции.",
+                self._config.permission_mode,
+            )
             options_kwargs["allow_dangerously_skip_permissions"] = True
-        if self._config.qoder_config_dir:
-            options_kwargs["env"] = {
-                **os.environ,
-                "QODER_CONFIG_DIR": self._config.qoder_config_dir,
-            }
+
+        # В дочерний процесс не попадают токен бота и прочие секреты
+        # родительского окружения; см. env_policy.py.
+        options_kwargs["env"] = build_child_env(self._config.qoder_config_dir)
+
+        # Жёсткая граница для файловых инструментов: абсолютные пути,
+        # симлинки и выход из cwd отклоняются до выполнения.
+        hook_callback: Any = self._pre_tool_use
+        options_kwargs["hooks"] = {
+            "PreToolUse": [
+                HookMatcher(matcher=FILE_TOOL_MATCHER, hooks=[hook_callback])
+            ]
+        }
 
         options = QoderAgentOptions(**options_kwargs)
         async with QoderSDKClient(options=options) as client:
@@ -157,19 +193,52 @@ class QoderTask:
                 setattr(self, attribute, getattr(self, attribute) + int(value))
 
     async def _collect_usage(self, client: QoderSDKClient) -> None:
-        try:
-            info = await asyncio.wait_for(client.get_usage_info(), timeout=5)
-        except Exception:
-            info = None
+        async def fetch(coro: Awaitable[Any], label: str) -> Any:
+            try:
+                return await asyncio.wait_for(coro, timeout=5)
+            except Exception as exc:  # noqa: BLE001 - использование не критично
+                log.debug("%s недоступен: %s", label, exc)
+                return None
+
+        info, context = await asyncio.gather(
+            fetch(client.get_usage_info(), "usage info"),
+            fetch(client.get_context_usage(), "context usage"),
+        )
         if isinstance(info, dict):
             self.usage_info = info
-
-        try:
-            context = await asyncio.wait_for(client.get_context_usage(), timeout=5)
-        except Exception:
-            context = None
         if isinstance(context, dict):
             self.context_usage = context
+
+    async def _pre_tool_use(
+        self,
+        input_data: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        """PreToolUse: не выпускать файловые инструменты за пределы cwd."""
+
+        try:
+            tool_name = str(input_data.get("tool_name") or "")
+            if tool_name not in FILE_TOOLS:
+                return {}
+            tool_input = input_data.get("tool_input") or {}
+            result = evaluate_tool(
+                tool_name,
+                tool_input,
+                self._cwd,
+                force_confirm=self._config.requires_confirmation(tool_name),
+                approve_writes=self._config.approval_mode in {"balanced", "trusted"},
+            )
+            if result.action == "deny":
+                log.warning("tool policy denied %s: %s", tool_name, result.reason)
+                return _hook_output("deny", result.reason or "Операция запрещена.")
+            if result.action == "allow":
+                return _hook_output("allow", result.reason, result.input)
+            # "ask" оставляем can_use_tool, чтобы не дублировать подтверждение.
+            return {}
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            log.warning("PreToolUse hook failed: %s", exc)
+            return _hook_output("deny", "Политика инструментов недоступна.")
 
     async def _can_use_tool(
         self,
@@ -193,8 +262,27 @@ class QoderTask:
                 updated_input={"questions": questions, "answers": answers}
             )
 
+        requires_confirm = self._config.requires_confirmation(tool_name)
+        trusted = self._config.approval_mode == "trusted"
+        is_bash = tool_name.casefold() == "bash"
+        is_network = tool_name.casefold() in {
+            name.casefold() for name in NETWORK_TOOLS
+        }
+
+        # Сеть без подтверждения: trusted или AUTO_APPROVE_NETWORK=1.
+        if is_network and not requires_confirm:
+            return PermissionResultAllow(updated_input=input_data)
+
+        # trusted: любой Bash без подтверждения, если ALWAYS_CONFIRM_TOOLS
+        # не требует обратного. Файловые инструменты всё равно проходят policy.
+        if trusted and not requires_confirm and is_bash:
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Безопасные Bash-команды могут выполняться без подтверждения
+        # (режим SAFE_BASH_MODE); policy их не отменяет.
         if (
-            tool_name == "Bash"
+            is_bash
+            and not requires_confirm
             and self._config.safe_bash_mode != "off"
             and not input_data.get("dangerouslyDisableSandbox")
         ):
@@ -207,8 +295,35 @@ class QoderTask:
                 log.info("auto-approved Bash: %s", command[:300])
                 return PermissionResultAllow(updated_input=input_data)
 
+        # Defense in depth: даже если хук не сработал, файловые инструменты
+        # проверяются здесь (allow/ask/deny). В balanced/trusted запись внутри
+        # cwd разрешена, выход за cwd остаётся deny.
+        policy = evaluate_tool(
+            tool_name,
+            input_data,
+            self._cwd,
+            force_confirm=requires_confirm,
+            approve_writes=self._config.approval_mode in {"balanced", "trusted"},
+        )
+        if policy.action == "deny":
+            log.warning("tool policy denied %s: %s", tool_name, policy.reason)
+            return PermissionResultDeny(
+                message=policy.reason or "Операция запрещена политикой."
+            )
+        if policy.action == "allow":
+            return PermissionResultAllow(updated_input=policy.input)
+        input_data = policy.input
+
+        # trusted: остальные (не файловые) инструменты без подтверждения.
+        if trusted and not requires_confirm:
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Для ALWAYS_CONFIRM_TOOLS и обязательных сетевых инструментов
+        # «разрешить на сессию» не предлагаем.
+        allow_session = not requires_confirm
+
         try:
-            decision = await self._approve(tool_name, input_data, context)
+            decision = await self._approve(tool_name, input_data, context, allow_session)
         except Exception:
             return PermissionResultDeny(message="Не удалось получить подтверждение пользователя.")
 
@@ -217,7 +332,9 @@ class QoderTask:
         if decision is Decision.ALWAYS:
             return PermissionResultAllow(
                 updated_input=input_data,
-                updated_permissions=getattr(context, "suggestions", None),
+                updated_permissions=(
+                    getattr(context, "suggestions", None) if allow_session else None
+                ),
             )
         return PermissionResultDeny(message="Пользователь отклонил операцию.")
 
@@ -227,5 +344,5 @@ class QoderTask:
             return
         try:
             await client.interrupt()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("interrupt failed: %s", exc)
