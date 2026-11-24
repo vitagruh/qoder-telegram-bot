@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, cast
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction
+from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -32,6 +32,7 @@ from aiogram.types import (
 import admin_view
 from approvals import ApprovalManager, Decision
 from config import Config, load_config
+from formatting import html_to_plain, render_html_chunks
 from qoder_runner import QoderTask
 from state_store import StateStore
 from task_log import TaskLog, format_entry
@@ -573,17 +574,41 @@ def build_router(
 
     async def finish_status(status: Message, text: str, user_id: int, ref: str) -> None:
         bot = cast(Bot, status.bot)
-        chunks = split_text(text) or ["✅ Готово."]
+        chunks = render_html_chunks(text) or ["✅ Готово."]
         keyboard = result_keyboard(user_id, ref)
+
+        async def send_chunk(
+            chunk: str,
+            reply_markup: InlineKeyboardMarkup | None = None,
+        ) -> None:
+            try:
+                await bot.send_message(
+                    status.chat.id,
+                    chunk,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest as exc:
+                log.warning("HTML send failed, falling back to plain text: %s", exc)
+                await bot.send_message(
+                    status.chat.id,
+                    html_to_plain(chunk),
+                    reply_markup=reply_markup,
+                )
+
         try:
-            await status.edit_text(chunks[0], reply_markup=keyboard)
+            await status.edit_text(
+                chunks[0],
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+            )
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc):
-                await bot.send_message(status.chat.id, chunks[0], reply_markup=keyboard)
+                await send_chunk(chunks[0], keyboard)
         except Exception:
-            await bot.send_message(status.chat.id, chunks[0], reply_markup=keyboard)
+            await send_chunk(chunks[0], keyboard)
         for chunk in chunks[1:]:
-            await bot.send_message(status.chat.id, chunk)
+            await send_chunk(chunk)
 
     async def execute(
         message: Message,
